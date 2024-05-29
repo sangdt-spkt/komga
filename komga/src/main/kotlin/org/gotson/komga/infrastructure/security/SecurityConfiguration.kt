@@ -3,18 +3,25 @@ package org.gotson.komga.infrastructure.security
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.gotson.komga.domain.model.ROLE_ADMIN
 import org.gotson.komga.domain.model.ROLE_USER
-import org.gotson.komga.infrastructure.configuration.KomgaProperties
 import org.gotson.komga.infrastructure.configuration.KomgaSettingsProvider
+import org.gotson.komga.infrastructure.security.apikey.ApiKeyAuthenticationProvider
+import org.gotson.komga.infrastructure.security.apikey.UriRegexApiKeyAuthenticationConverter
 import org.springframework.boot.actuate.autoconfigure.security.servlet.EndpointRequest
 import org.springframework.boot.actuate.health.HealthEndpoint
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import org.springframework.core.annotation.Order
+import org.springframework.security.authentication.AuthenticationEventPublisher
+import org.springframework.security.authentication.AuthenticationManager
+import org.springframework.security.authentication.ProviderManager
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity
 import org.springframework.security.config.annotation.web.builders.HttpSecurity
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity
+import org.springframework.security.config.annotation.web.invoke
 import org.springframework.security.config.http.SessionCreationPolicy
 import org.springframework.security.core.session.SessionRegistry
 import org.springframework.security.core.userdetails.UserDetailsService
+import org.springframework.security.crypto.password.PasswordEncoder
 import org.springframework.security.oauth2.client.oidc.userinfo.OidcUserRequest
 import org.springframework.security.oauth2.client.registration.InMemoryClientRegistrationRepository
 import org.springframework.security.oauth2.client.userinfo.OAuth2UserRequest
@@ -23,6 +30,8 @@ import org.springframework.security.oauth2.core.OAuth2AuthenticationException
 import org.springframework.security.oauth2.core.oidc.user.OidcUser
 import org.springframework.security.oauth2.core.user.OAuth2User
 import org.springframework.security.web.SecurityFilterChain
+import org.springframework.security.web.authentication.AnonymousAuthenticationFilter
+import org.springframework.security.web.authentication.AuthenticationFilter
 import org.springframework.security.web.authentication.SimpleUrlAuthenticationFailureHandler
 import org.springframework.security.web.authentication.WebAuthenticationDetailsSource
 import org.springframework.security.web.authentication.rememberme.TokenBasedRememberMeServices
@@ -34,19 +43,22 @@ private val logger = KotlinLogging.logger {}
 @EnableWebSecurity
 @EnableMethodSecurity(prePostEnabled = true)
 class SecurityConfiguration(
-  private val komgaProperties: KomgaProperties,
   private val komgaSettingsProvider: KomgaSettingsProvider,
-  private val komgaUserDetailsLifecycle: UserDetailsService,
+  private val komgaUserDetailsService: UserDetailsService,
+  private val apiKeyAuthenticationProvider: ApiKeyAuthenticationProvider,
   private val oauth2UserService: OAuth2UserService<OAuth2UserRequest, OAuth2User>,
   private val oidcUserService: OAuth2UserService<OidcUserRequest, OidcUser>,
   private val sessionCookieName: String,
   private val userAgentWebAuthenticationDetailsSource: WebAuthenticationDetailsSource,
   private val sessionRegistry: SessionRegistry,
   private val opdsAuthenticationEntryPoint: OpdsAuthenticationEntryPoint,
+  private val authenticationEventPublisher: AuthenticationEventPublisher,
+  private val tokenEncoder: TokenEncoder,
   clientRegistrationRepository: InMemoryClientRegistrationRepository?,
 ) {
   private val oauth2Enabled = clientRegistrationRepository != null
 
+  @Order(1)
   @Bean
   fun filterChain(http: HttpSecurity): SecurityFilterChain {
     http
@@ -92,6 +104,7 @@ class SecurityConfiguration(
         headersConfigurer.cacheControl { it.disable() } // headers are set in WebMvcConfiguration
         headersConfigurer.frameOptions { it.sameOrigin() } // for epubreader iframes
       }
+      .userDetailsService(komgaUserDetailsService)
       .httpBasic {
         it.authenticationDetailsSource(userAgentWebAuthenticationDetailsSource)
       }
@@ -129,13 +142,15 @@ class SecurityConfiguration(
             val url = "/login?server_redirect=Y&error=$errorMessage"
             SimpleUrlAuthenticationFailureHandler(url).onAuthenticationFailure(request, response, exception)
           }
+        oauth2.redirectionEndpoint {
+        }
       }
     }
 
     http
       .rememberMe {
         it.rememberMeServices(
-          TokenBasedRememberMeServices(komgaSettingsProvider.rememberMeKey, komgaUserDetailsLifecycle).apply {
+          TokenBasedRememberMeServices(komgaSettingsProvider.rememberMeKey, komgaUserDetailsService).apply {
             setTokenValiditySeconds(komgaSettingsProvider.rememberMeDuration.inWholeSeconds.toInt())
             setAuthenticationDetailsSource(userAgentWebAuthenticationDetailsSource)
           },
@@ -144,4 +159,49 @@ class SecurityConfiguration(
 
     return http.build()
   }
+
+  @Bean
+  fun koboFilterChain(
+    http: HttpSecurity,
+    encoder: PasswordEncoder,
+  ): SecurityFilterChain {
+    http {
+      cors {}
+
+      csrf { disable() }
+      formLogin { disable() }
+      httpBasic { disable() }
+      logout { disable() }
+
+      securityMatcher("/kobo/**")
+      authorizeHttpRequests {
+        authorize(anyRequest, hasRole(ROLE_USER)) // TODO: update to ROLE_KOBO
+      }
+
+      headers {
+        cacheControl { disable() }
+      }
+
+      sessionManagement {
+        sessionCreationPolicy = SessionCreationPolicy.STATELESS
+      }
+
+      addFilterBefore<AnonymousAuthenticationFilter>(koboAuthenticationFilter())
+    }
+
+    return http.build()
+  }
+
+  fun koboAuthenticationFilter(): AuthenticationFilter =
+    AuthenticationFilter(
+      apiKeyAuthenticationProvider(),
+      UriRegexApiKeyAuthenticationConverter(Regex("""\/kobo\/([\w-]+)"""), tokenEncoder, userAgentWebAuthenticationDetailsSource),
+    ).apply {
+      setSuccessHandler { _, _, _ -> } // to avoid default redirection to "/"
+    }
+
+  fun apiKeyAuthenticationProvider(): AuthenticationManager =
+    ProviderManager(apiKeyAuthenticationProvider).apply {
+      setAuthenticationEventPublisher(authenticationEventPublisher)
+    }
 }

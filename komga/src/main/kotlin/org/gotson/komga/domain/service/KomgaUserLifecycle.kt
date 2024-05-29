@@ -1,6 +1,7 @@
 package org.gotson.komga.domain.service
 
 import io.github.oshai.kotlinlogging.KotlinLogging
+import org.gotson.komga.domain.model.ApiKey
 import org.gotson.komga.domain.model.DomainEvent
 import org.gotson.komga.domain.model.KomgaUser
 import org.gotson.komga.domain.model.UserEmailAlreadyExistsException
@@ -9,6 +10,8 @@ import org.gotson.komga.domain.persistence.KomgaUserRepository
 import org.gotson.komga.domain.persistence.ReadProgressRepository
 import org.gotson.komga.domain.persistence.SyncPointRepository
 import org.gotson.komga.infrastructure.security.KomgaPrincipal
+import org.gotson.komga.infrastructure.security.TokenEncoder
+import org.gotson.komga.infrastructure.security.apikey.ApiKeyGenerator
 import org.springframework.context.ApplicationEventPublisher
 import org.springframework.security.core.session.SessionRegistry
 import org.springframework.security.crypto.password.PasswordEncoder
@@ -24,9 +27,11 @@ class KomgaUserLifecycle(
   private val authenticationActivityRepository: AuthenticationActivityRepository,
   private val syncPointRepository: SyncPointRepository,
   private val passwordEncoder: PasswordEncoder,
+  private val tokenEncoder: TokenEncoder,
   private val sessionRegistry: SessionRegistry,
   private val transactionTemplate: TransactionTemplate,
   private val eventPublisher: ApplicationEventPublisher,
+  private val apiKeyGenerator: ApiKeyGenerator,
 ) {
   fun updatePassword(
     user: KomgaUser,
@@ -97,5 +102,30 @@ class KomgaUserLifecycle(
         logger.info { "Expiring session: ${it.sessionId}" }
         it.expireNow()
       }
+  }
+
+  /**
+   * Create and persist an API key for the user.
+   * @return the ApiKey, or null if a unique API key could not be generated
+   */
+  fun createApiKey(
+    user: KomgaUser,
+    comment: String,
+  ): ApiKey? {
+    for (attempt in 1..10) {
+      try {
+        val plainTextKey =
+          ApiKey(
+            userId = user.id,
+            key = apiKeyGenerator.generate(),
+            comment = comment,
+          )
+        userRepository.insert(plainTextKey.copy(key = tokenEncoder.encode(plainTextKey.key)))
+        return plainTextKey
+      } catch (e: Exception) {
+        logger.debug { "Failed to generate unique api key, attempt #$attempt" }
+      }
+    }
+    return null
   }
 }
